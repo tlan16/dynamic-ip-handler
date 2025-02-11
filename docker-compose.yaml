@@ -1,0 +1,16 @@
+---
+services:
+  app:
+    container_name: dynamic-ip-handler
+    environment:
+      - APP_EMAIL_FROM
+      - APP_EMAIL_TO
+      - APP_SMTP_HOST
+      - APP_SMTP_PORT
+      - APP_SMTP_USERNAME
+      - APP_SMTP_PASSWORD
+    build:
+        context: .
+        dockerfile: Dockerfile
+    volumes:
+      - ./data.csv:/app/data.csv

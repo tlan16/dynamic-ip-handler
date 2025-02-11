@@ -1,0 +1,10 @@
+/target
+.idea/
+.DS_Store
+
+.env
+Dockerfile
+.dockerignore
+docker-compose.yaml
+.git/
+data.csv
