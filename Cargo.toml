@@ -1,7 +1,14 @@
 [package]
 name = "dynamic-ip-handler"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+
+[profile.release]
+strip = true  # Strip debug symbols.
+opt-level = "z"  # Optimize for size.
+lto = true  # Enable link-time optimization.
+codegen-units = 1  # Use a single codegen unit.
+panic = "abort"  # Abort on panic.
 
 [dependencies]
 polars = { version = "0.46.0", features = ["lazy", "csv"] }
