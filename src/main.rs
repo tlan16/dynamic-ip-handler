@@ -1,38 +1,59 @@
 extern crate dotenv;
 
-use std::env;
-use polars::df;
-use polars::frame::DataFrame;
-use polars::prelude::{
-    CsvReadOptions, CsvWriter, IntoLazy, SerReader, SerWriter, SortMultipleOptions,
-};
-use std::net::Ipv4Addr;
+use arrow::array::{ArrayRef, StringArray};
+use arrow::compute::{sort_to_indices, take, SortOptions};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::error::ArrowError;
+use arrow::record_batch::RecordBatch;
+use arrow_csv::ReaderBuilder;
 use dotenv::dotenv;
 use mail_send::mail_builder::MessageBuilder;
 use mail_send::SmtpClientBuilder;
+use std::env;
+use std::fs::File;
+use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    
-    let ip_v4 = get_public_ip_v4().await.unwrap();
-    println!("public ip v4 address: {}", ip_v4);
 
     let data_file_name = "data.csv";
     if !std::path::Path::new(data_file_name).exists() {
-        create_data_file(data_file_name, ip_v4.to_string()).await;
+        init_data_file(data_file_name);
     }
-    let (last_ip_v4, df) = get_last_recorded_ip_v4(data_file_name).await;
-    println!("last recorded ip v4 address: {}", last_ip_v4);
 
-    if ip_v4.to_string() != last_ip_v4 {
-        on_ip_v4_change(last_ip_v4, ip_v4.to_string(), data_file_name, df).await;
+    let ip_v4 = get_public_ip_v4().await.unwrap();
+    println!("public ip v4 address: {}", ip_v4.clone().to_string());
+
+    let last_ip_v4 = get_last_recorded_ip_v4(data_file_name);
+    let has_last_ip_v4 = !last_ip_v4.clone().is_none();
+    if !has_last_ip_v4 {
+        println!("No record found in file: {}", data_file_name);
     } else {
-        println!("IP remained the same as {}", last_ip_v4);
+        println!("Last ip v4: {:} at {:}", last_ip_v4.clone().unwrap().clone().ip_v4, last_ip_v4.clone().unwrap().clone().timestamp);
+    }
+    let should_record_ip_v4 = last_ip_v4.clone().is_none() || last_ip_v4.clone().unwrap().ip_v4 != ip_v4.to_string();
+    println!("Should record ip v4: {}", should_record_ip_v4);
+    if should_record_ip_v4 == false {
+        return;
+    }
+
+    if should_record_ip_v4 {
+        record_ip_v4(data_file_name, ip_v4.clone()).await;
+        println!("IP address recorded: {}", ip_v4);
+        let from_ip_v4: Option<String> = if has_last_ip_v4 { Some(last_ip_v4.clone().unwrap().ip_v4) } else { None };
+        send_email(from_ip_v4, ip_v4.clone().to_string()).await;
     }
 }
 
-async fn send_email(from_ip_v4: String, to_ip_v4: String) {
+#[derive(Debug, Clone)]
+struct DataRow {
+    ip_v4: String,
+    timestamp: String,
+}
+
+async fn send_email(from_ip_v4: Option<String>, to_ip_v4: String) {
     println!("Sending email notification");
     let sender = env::vars().find(|(key, _)| key == "APP_EMAIL_FROM").unwrap().1;
     let receiver = env::vars().find(|(key, _)| key == "APP_EMAIL_TO").unwrap().1;
@@ -43,7 +64,7 @@ async fn send_email(from_ip_v4: String, to_ip_v4: String) {
             ("Frank Lan", receiver.as_str()),
         ])
         .subject("IP address changed")
-        .text_body(format!("IP address changed from {} to {}", from_ip_v4, to_ip_v4));
+        .text_body(format!("IP address changed from {} to {}", from_ip_v4.unwrap_or("None".to_string()), to_ip_v4));
 
     let host = env::vars().find(|(key, _)| key == "APP_SMTP_HOST").unwrap().1;
     let username = env::vars().find(|(key, _)| key == "APP_SMTP_USERNAME").unwrap().1;
@@ -60,59 +81,79 @@ async fn send_email(from_ip_v4: String, to_ip_v4: String) {
         .unwrap();
 }
 
-async fn on_ip_v4_change(from_ip_v4: String, to_ip_v4: String, data_file_name: &str, df: DataFrame) {
-    println!("IP address changed from {} to {}", from_ip_v4, to_ip_v4);
-    record_ip_v4(data_file_name, to_ip_v4.clone(), Option::from(df)).await;
-    send_email(from_ip_v4, to_ip_v4.clone()).await;
-}
-
-async fn create_data_file(data_file_name: &str, ip_v4: String) {
+fn init_data_file(data_file_name: &str) {
     println!("Creating new file: {}", data_file_name);
-    record_ip_v4(data_file_name, ip_v4, None).await;
-    println!("File created: {}", data_file_name);
+    File::create(data_file_name).unwrap();
+    insert_string_at_second_line(data_file_name, "ip_v4,timestamp").unwrap();
+    println!("File initiated: {}", data_file_name);
 }
 
-async fn record_ip_v4(data_file_name: &str, ip_v4: String, df: Option<DataFrame>) {
-    let mut df2: DataFrame = df!(
-        "ip_v4" => [ip_v4],
-        "timestamp" => [chrono::Utc::now().to_rfc3339()]
-    )
-    .unwrap();
-    if df.is_none() {
-        let mut file = std::fs::File::create(data_file_name).unwrap();
-        CsvWriter::new(&mut file).finish(&mut df2).unwrap();
-    } else if let Some(df) = df {
-        println!("Appending new record to file: {}", data_file_name);
-        let mut df3= df.vstack(&df2).unwrap().sort(
-            ["timestamp"],
-            SortMultipleOptions::default()
-                .with_order_descending(true),
-        ).unwrap();
-        let mut file = std::fs::File::create(data_file_name).unwrap();
-        CsvWriter::new(&mut file).finish(&mut df3).unwrap();
+async fn record_ip_v4(data_file_name: &str, ip_v4: Ipv4Addr) {
+    let new_line = format!("{},{}", ip_v4.to_string(), chrono::Utc::now().to_rfc3339());
+    insert_string_at_second_line(data_file_name, new_line.as_str()).unwrap();
+}
+
+
+fn insert_string_at_second_line(file_path: &str, string_to_insert: &str) -> std::io::Result<()> {
+    let content = std::fs::read_to_string(file_path)?;
+    let mut lines: Vec<&str> = content.lines().collect();
+
+    if !lines.is_empty() {
+        lines.insert(1, string_to_insert);
+    } else {
+        lines.push(string_to_insert);
     }
+
+    let new_content = lines.join("\n");
+
+    std::fs::write(file_path, new_content)?;
+    Ok(())
 }
 
-async fn get_last_recorded_ip_v4(data_file_name: &str) -> (String, DataFrame) {
-    let df = CsvReadOptions::default()
-        .with_has_header(true)
-        .try_into_reader_with_file_path(Some(data_file_name.into()))
-        .unwrap()
-        .finish()
+fn get_last_recorded_ip_v4(data_file_name: &str) -> Option<DataRow> {
+    let file = File::open(data_file_name).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ip_v4", DataType::Utf8, false),
+        Field::new("timestamp", DataType::Utf8, false),
+    ]));
+    let mut csv_reader = ReaderBuilder::new(schema.clone()).with_header(true).build(file).unwrap();
+
+    let batch = csv_reader.next();
+    if batch.is_none() {
+        return None;
+    }
+    let batch = batch.unwrap().unwrap();
+
+    let timestamp_array = batch.column(1);
+    let sort_options = SortOptions {
+        descending: true,
+        nulls_first: false,
+    };
+    let sorted_indices = sort_to_indices(timestamp_array, Some(sort_options), Some(1)).unwrap();
+    let sorted_columns: Vec<ArrayRef> = batch.columns()
+        .iter()
+        .map(|column| take(column, &sorted_indices, None))
+        .collect::<Result<Vec<_>, ArrowError>>()
         .unwrap();
-    let last_ip_v4_df = df
-        .clone()
-        .lazy()
-        .sort(
-            ["timestamp"],
-            SortMultipleOptions::default()
-                .with_order_descending(true),
-        )
-        .limit(1)
-        .collect()
-        .unwrap();
-    let last_ip_v4 = last_ip_v4_df.column("ip_v4").unwrap().get(0).unwrap();
-    return (last_ip_v4.get_str().unwrap().to_string(), df);
+    let sorted_batch = RecordBatch::try_new(batch.schema(), sorted_columns).unwrap();
+
+    let ip_array = sorted_batch.column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("Column 0 should be a StringArray");
+    let timestamp_array = sorted_batch.column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("Column 1 should be a StringArray");
+
+    // Get the first row values.
+    let first_ip = ip_array.value(0);
+    let first_timestamp = timestamp_array.value(0);
+
+    Some(DataRow {
+        ip_v4: first_ip.to_string(),
+        timestamp: first_timestamp.to_string(),
+    })
 }
 
 async fn get_public_ip_v4() -> Option<Ipv4Addr> {
